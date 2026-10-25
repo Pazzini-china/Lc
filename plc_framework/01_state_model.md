@@ -74,6 +74,26 @@ B 档可加：40 收尾中、50 已完成、60 已停止。
 
 > 说明：这个"四段式"是**工程写法归纳**，不是标准原文里的术语。ISA-88 / PackML 只规定状态语义，不规定程序怎么分区；西门子 LAD、PCS 7 APL 等库内部有类似的"输入 → 联锁/模式 → 输出 → 诊断"分区，但名称和切分方式因库而异。要严格对齐某个库，以该库块的 region 划分为准。
 
+### 3.1 先分清三种输入，否则一定写乱
+
+PackML 状态图上的 Start / Stop / Reset 是**机器（Unit/EM）级**的操作命令，不是 CM 的命令。照搬到 CM 上，就会出现"CM 也收 Start，同时又收 ModeState"的重复感。
+
+| 输入 | 来源 | 作用域 | 回答的问题 |
+|---|---|---|---|
+| 操作命令 Start / Stop / Reset | HMI / 操作盒 → **ModeMgr 或 EM** 收口 | Unit / EM | 整机要不要跑 |
+| 模式 ModeState（自动/手动/维护） | ModeMgr | Unit（下发到所有块） | 现在允不允许动 |
+| 动作请求 Req.Execute / Release | EM 步序（手动模式下来自 HMI 单步） | 单个 CM | 这一个动作要不要做 |
+
+结论：**CM 只接"模式"和"动作请求"两个输入，不接 Start/Stop/Reset。**
+`Start/Stop/Reset` 与 `Mode` 也不要塞进同一个结构体，否则看起来像同级信号。
+
+```mermaid
+flowchart LR
+  M[ModeMgr] -- 模式 --> C[CM 功能块]
+  E[EM 步序] -- 动作请求 --> C
+  C -. 状态 .-> E
+```
+
 每个 CM 的 FB 固定按这个顺序写，好处是**只有一处写状态、只有一处写输出**，不会出现竞争。
 
 ```
@@ -98,8 +118,9 @@ B 档可加：40 收尾中、50 已完成、60 已停止。
 ```scl
 FUNCTION_BLOCK "FB_Cyl_Extend"
 VAR_INPUT
-  Cmd : "Cmd_t";      // Enable / Start / Stop / Reset / Mode
-  Par : "Par_t";      // T_Start / T_Stop
+  ModeState : "Mode_t";   // 来自 ModeMgr：自动 / 手动 / 维护
+  Req       : "Req_t";    // 来自 EM 步序：Execute / Release / Reset
+  Par       : "Par_t";    // T_Start / T_Stop
 END_VAR
 VAR_OUTPUT
   Stat : "Stat_t";
@@ -119,8 +140,8 @@ VAR
 END_VAR
 BEGIN
   // ---------- 0 输入处理 ----------
-  rtStart(CLK := Cmd.Start);
-  rtReset(CLK := Cmd.Reset);
+  rtStart(CLK := Req.Execute);
+  rtReset(CLK := Req.Reset);
   sensExt := "I_SensExt";
   sensRet := "I_SensRet";
 
@@ -144,7 +165,7 @@ BEGIN
   // ---------- 2 状态迁移（唯一写 state 的地方） ----------
   CASE state OF
     0:   // Idle
-      IF rtStart.Q AND (Cmd.Mode = 2) THEN   // 2 = 自动
+      IF rtStart.Q AND (ModeState = cModeAuto) THEN
         state := 10;
       END_IF;
 
@@ -154,7 +175,7 @@ BEGIN
       END_IF;
 
     20:  // Execute
-      IF Cmd.Stop OR NOT Cmd.Enable THEN
+      IF (NOT Req.Execute) OR (ModeState <> cModeAuto) THEN
         state := 30;
       END_IF;
 
@@ -194,42 +215,41 @@ END_FUNCTION_BLOCK
 
 要点解释：
 
-- `rtStart` 用上升沿：否则从停止回到待机后，如果 Start 一直为 1，会立刻重启。
+- `rtStart` 用上升沿：否则从停止回到待机后，如果请求一直为 1，会立刻重启。
 - 定时器无条件调用：TON 只在被调用时计时，写在分支里会漏计时。
 - 故障跳转放在 CASE **之后**：保证同一周期内不会既执行状态分支又抱着故障继续跑。
-- `Cmd.Mode = 2` 硬编码不推荐，正式项目用常量。
+- `ModeState = cModeAuto` 不要在代码里写死数字，用常量。
+- 运行中模式被切走（`ModeState <> cModeAuto`）时直接走停止分支，不要等下一个周期——这是模式门控的兜底。
 
 ---
 
 ## 5 EM 层怎么用
 
-EM 只做三件事：**发命令、读状态、编排步序**。EM 不写 CM 的 `state`，也不直接写 Q。
+EM 只做三件事：**发动作请求、读状态、编排步序**。EM 不写 CM 的 `state`，也不直接写 Q，更不替 CM 决定模式。
 
 ```scl
-// EM 步序：命令/状态分离
+// EM 步序：请求 / 状态分离（注意这里发的是 reqCyl.Execute，不是 Start）
 CASE step OF
   10:  // 夹紧
-    cmdCyl.Start := TRUE;
+    reqCyl.Execute := TRUE;
     IF statCyl.Done THEN
-      cmdCyl.Start := FALSE;
+      reqCyl.Execute := FALSE;
       step := 20;
     ELSIF statCyl.Error THEN
       step := 900;
     END_IF;
 
   20:  // 进给
-    cmdAxis.Start := TRUE;
+    reqAxis.Execute := TRUE;
     IF statAxis.Done THEN
-      cmdAxis.Start := FALSE;
+      reqAxis.Execute := FALSE;
       step := 30;
     END_IF;
 
-  900: // 异常收尾：全部下停止，等状态回到 Idle
-    cmdCyl.Stop  := TRUE;
-    cmdAxis.Stop := TRUE;
+  900: // 异常收尾：撤请求，等各 CM 自己回到 Idle
+    reqCyl.Execute  := FALSE;
+    reqAxis.Execute := FALSE;
     IF (statCyl.State = 0) AND (statAxis.State = 0) THEN
-      cmdCyl.Stop  := FALSE;
-      cmdAxis.Stop := FALSE;
       step := 0;
     END_IF;
 END_CASE;
